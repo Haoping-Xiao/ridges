@@ -7,6 +7,13 @@
 
 FROM python:3.11-slim
 
+# Explicitly set user to root to ensure full permissions during build
+USER root
+
+# Remove problematic APT Post-Invoke hook that causes permission errors
+# This hook tries to clean cache files but fails during build
+RUN rm -f /etc/apt/apt.conf.d/docker-clean
+
 # Install system dependencies in a single layer
 RUN apt-get update && \
     apt-get install -y --no-install-recommends git patch diffutils && \

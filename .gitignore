@@ -21,6 +21,8 @@ test_agent_results/
 gui/
 analyzer/
 
+ridges_v2.egg-info/
+
 
 
 # OLD

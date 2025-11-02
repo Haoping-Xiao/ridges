@@ -1,5 +1,6 @@
 import docker
 import subprocess
+import os
 import utils.logger as logger
 
 
@@ -10,12 +11,42 @@ docker_client = None
 
 def _initialize_docker():
     logger.info("Initializing Docker...")
-    try:
-        global docker_client
-        docker_client = docker.from_env()
-        logger.info("Initialized Docker")
-    except Exception as e:
-        logger.fatal(f"Failed to initialize Docker: {e}")
+    global docker_client
+    
+    # 尝试多种方式连接 Docker
+    connection_methods = [
+        # 方法 1: 使用默认环境配置（DOCKER_HOST 环境变量或默认 socket）
+        lambda: docker.from_env(),
+        # 方法 2: 尝试 Docker Desktop 的 socket 路径（macOS）
+        lambda: docker.DockerClient(base_url='unix://' + os.path.expanduser('~/.docker/run/docker.sock')),
+        # 方法 3: 尝试传统的 Unix socket 路径
+        lambda: docker.DockerClient(base_url='unix:///var/run/docker.sock'),
+    ]
+    
+    last_error = None
+    for i, method in enumerate(connection_methods, 1):
+        try:
+            logger.info(f"尝试连接方式 {i}...")
+            docker_client = method()
+            # 测试连接是否有效
+            docker_client.version()
+            logger.info("Docker 初始化成功")
+            return
+        except Exception as e:
+            logger.warning(f"连接方式 {i} 失败: {e}")
+            last_error = e
+            continue
+    
+    # 所有方法都失败
+    error_msg = (
+        f"无法连接到 Docker daemon。\n"
+        f"最后尝试的错误: {last_error}\n"
+        f"请确保：\n"
+        f"  1. Docker Desktop 已启动并正在运行\n"
+        f"  2. Docker daemon 正在运行（尝试运行 'docker ps' 测试）\n"
+        f"  3. 您有访问 Docker socket 的权限"
+    )
+    logger.fatal(error_msg)
 
 
 
@@ -43,7 +74,11 @@ def build_docker_image(dockerfile_dir: str, tag: str) -> None:
     logger.info(f"Building Docker image: {tag}")
     
     try:
-        result = subprocess.run(["docker", "build", "-t", tag, dockerfile_dir], text=True)
+        # Capture output to help with debugging
+        result = subprocess.run(
+            ["docker", "build", "--network=host", "-t", tag, dockerfile_dir],
+            text=True
+        )
         
         if result.returncode == 0:
             logger.info(f"Successfully built Docker image: {tag}")
@@ -51,7 +86,6 @@ def build_docker_image(dockerfile_dir: str, tag: str) -> None:
             raise Exception(f"Docker build failed with exit code {result.returncode}")
             
     except Exception as e:
-
         logger.error(f"Failed to build Docker image: {e}")
         raise
 
