@@ -1,23 +1,24 @@
 from __future__ import annotations
+
 import ast
+import inspect
 import json
+import logging
 import os
-import requests
+import random
+import re
 import subprocess
-import ast, sys
+import sys
 import textwrap
 import time
 import traceback
+from enum import Enum
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from json import JSONDecodeError
-import re
-import inspect
-import random
-from enum import Enum
-import json
-import logging
 from uuid import uuid4
+
+import requests
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -390,7 +391,7 @@ class EnhancedToolManager:
 
     def get_final_git_patch(self) -> str:
         try:
-            command = f"""
+            command = """
             shopt -s globstar
 
             cp .gitignore .gitignore.backup 2>/dev/null || true
@@ -602,7 +603,7 @@ class EnhancedNetwork:
         error_msg = ""
         try:
             next_tool_args = Utils.load_json(next_tool_args.strip())
-        except JSONDecodeError as e:
+        except JSONDecodeError:
             error_msg = f"Invalid JSON: {next_tool_args}"
             try:
                 next_tool_args = cls.parse_malformed_json(
@@ -610,7 +611,7 @@ class EnhancedNetwork:
                 )
             except EnhancedToolManager.Error as e:
                 raise Exception(e.message)
-            except Exception as e:
+            except Exception:
                 raise Exception(error_msg)
         return next_tool_args
 
@@ -771,11 +772,11 @@ class Utils:
     def load_json(cls, json_string: str) -> dict:
         try:
             return json.loads(json_string)
-        except Exception as e:
+        except Exception:
             try:
                 return eval(json_string)
-            except Exception as e:
-                logger.info(f"unable to fix manually, trying with llm")
+            except Exception:
+                logger.info("unable to fix manually, trying with llm")
                 fixed_json = EnhancedNetwork.fix_json_string_with_llm(json_string)
                 if fixed_json:
                     return fixed_json
@@ -977,7 +978,7 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
             content: text data to write
         """
         if "test" in file_path.lower() or "reproduce" in file_path.lower():
-            return f"Error: You cannot use this tool to create test or files to reproduce the error."
+            return "Error: You cannot use this tool to create test or files to reproduce the error."
         return self._save(file_path, content)
 
     @EnhancedToolManager.tool
@@ -1000,7 +1001,7 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
             parsed_solutions.extend(sols)
         solutions = parsed_solutions
         if type(solutions) is not list or len(solutions) < 2:
-            return f"Error: solutions must be a list with length at least 2."
+            return "Error: solutions must be a list with length at least 2."
         self.is_solution_approved = True
         return "Approved"
 
@@ -1433,7 +1434,7 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
         if search == replace:
             return "ERROR: search and replace are the same. Please provide a different search and replace."
         if not self.is_solution_approved:
-            return f"Error: You cannot use this tool before you have approval from user on your proposed solution. Please call get_approval_for_solution tool first with list of proposed solutions."
+            return "Error: You cannot use this tool before you have approval from user on your proposed solution. Please call get_approval_for_solution tool first with list of proposed solutions."
         if not os.path.exists(file_path):
             return f"Error: file '{file_path}' does not exist."
 
@@ -1447,7 +1448,7 @@ class FixTaskEnhancedToolManager(EnhancedToolManager):
                 error_msg = f"Error: search string not found in file {file_path}."
 
                 if similar_matches:
-                    error_msg += f"\n\nMost similar snippet found (you may need to adjust your search string):"
+                    error_msg += "\n\nMost similar snippet found (you may need to adjust your search string):"
                     for i, (ratio, content) in enumerate(similar_matches, 1):
                         similarity_pct = int(ratio * 100)
                         # Add context lines around the match for better understanding
@@ -1728,7 +1729,7 @@ def get_test_runner_and_mode(repo_dir: str = "."):
             break
 
     if not test_file_path:
-        print(f"no test file found")
+        print("no test file found")
         return "pytest", "FILE"
 
     print(f"test_file_path: {test_file_path}")
@@ -1851,12 +1852,12 @@ def generate_initial_solution(problem_statement: str, code_skeleton: str, temper
                 code_generation_messages.append(
                     {
                         "role": "user",
-                        "content": f"Include file name in the response. example:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```",
+                        "content": "Include file name in the response. example:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```",
                     }
                 )
                 continue
             return solution
-        except Exception as e:
+        except Exception:
             retry += 1
             time.sleep(2)
     if retry >= 10:
@@ -1921,7 +1922,7 @@ def generate_single_testset(
                 test_generation_messages.append(
                     {
                         "role": "user",
-                        "content": f"Include file name in the response. example:\n```python\ntest_a.py\ncontents of test_a.py\n\ntest_b.py\ncontents of test_b.py\n```",
+                        "content": "Include file name in the response. example:\n```python\ntest_a.py\ncontents of test_a.py\n\ntest_b.py\ncontents of test_b.py\n```",
                     }
                 )
                 print(f"Retrying because the first line is not a python test file name:\n {testcases}")
@@ -2087,12 +2088,12 @@ def generate_initial_solution_with_patterns(
                 code_generation_messages.append(
                     {
                         "role": "user",
-                        "content": f"Include file name in the response. example:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```",
+                        "content": "Include file name in the response. example:\n```python\na.py\ncontents of a.py\n\nb.py\ncontents of b.py\n```",
                     }
                 )
                 continue
             return solution
-        except Exception as e:
+        except Exception:
             retry += 1
             time.sleep(RETRY_BASE_DELAY)
     if retry >= MAX_INFERENCE_RETRIES:
@@ -2132,7 +2133,7 @@ def fix_task_solve_workflow(
         test_runner=test_runner,
         test_runner_mode=test_runner_mode,
     )
-    logger.info(f"Starting main agent execution...")
+    logger.info("Starting main agent execution...")
     system_prompt = FIX_TASK_SYSTEM_PROMPT.format(
         tools_docs=tool_manager.get_tool_docs(), format_prompt=FORMAT_PROMPT_V0, extra_fix_request=extra_fix_request
     )
@@ -2164,7 +2165,7 @@ def fix_task_solve_workflow(
         temperature = 0
         selected_model = GLM_MODEL_NAME
         if cot.is_thought_repeated():
-            logger.info(f"[TEST_PATCH_FIND] Thought repeated, adding DO NOT REPEAT TOOL CALLS instruction")
+            logger.info("[TEST_PATCH_FIND] Thought repeated, adding DO NOT REPEAT TOOL CALLS instruction")
             last_thought = cot.thoughts[-1]
             messages.append(
                 {
@@ -2302,7 +2303,7 @@ def fix_task_solve_workflow(
         if n_max_steps < MAX_FIX_TASK_STEPS:
             return None
     logger.info(f"[CRITICAL] Workflow execution completed after {step + 1} steps")
-    logger.info(f"[CRITICAL] About to generate final patch...")
+    logger.info("[CRITICAL] About to generate final patch...")
     patch = tool_manager.get_final_git_patch()
     logger.info(f"Final Patch Generated..: Length: {len(patch)}")
 
