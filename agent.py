@@ -12,6 +12,7 @@ import sys
 import textwrap
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
 from json import JSONDecodeError
 from pathlib import Path
@@ -70,19 +71,37 @@ FORMAT_PROMPT_V0 = textwrap.dedent("""
      - Code analysis
      - Solution justification
      - Validation plan)
-   - `next_tool_name`: Must be an exact tool name from the tool list
+   - `next_tool_name`: Must be an exact tool name from the tool list, OR a JSON array of tool names for parallel execution
    - `next_tool_args`: Valid JSON with:
      - Proper escaping
      - No trailing commas
      - Tool-specific parameters
+     - OR a JSON array of argument objects when using parallel tool calls
 
-2. **Error Handling Format**:
+2. **Parallel Tool Calls (Recommended for Exploration)**:
+   - You can call multiple tools in parallel to speed up exploration
+   - Format for parallel calls:
+     next_thought: "I'll search for multiple patterns in parallel to understand the codebase"
+     next_tool_name: ["search_in_all_files_content", "search_in_all_files_content", "get_file_content"]
+     next_tool_args: [
+       {"search_term": "def process_data", "case_sensitive": false},
+       {"search_term": "class DataProcessor", "case_sensitive": false},
+       {"file_path": "main.py"}
+     ]
+   - All parallel tool calls will execute simultaneously
+   - Results will be combined and returned together
+   - Use parallel calls when:
+     * Searching for multiple related patterns
+     * Reading multiple files simultaneously
+     * Exploring different aspects of the codebase
+
+3. **Error Handling Format**:
    - For errors: 
      next_thought: "Error: [detailed explanation]"
      next_tool_name: ""
      next_tool_args: {}
 
-3. **Example Valid Format**:
+4. **Example Valid Format (Single Tool)**:
    next_thought: "I'll fix the JSON parsing issue by adding proper error handling and validation"
    next_tool_name: "apply_code_edit"
    next_tool_args: {
@@ -91,12 +110,22 @@ FORMAT_PROMPT_V0 = textwrap.dedent("""
      "replace": "try:\n    return json.loads(response)\nexcept JSONDecodeError:\n    logger.error(f'Invalid JSON: {{response}}')\n    raise"
    }
 
-4. **Invalid Format Examples** (Avoid These):
+5. **Example Valid Format (Parallel Tools)**:
+   next_thought: "I'll search for all occurrences of the bug pattern and read related files in parallel"
+   next_tool_name: ["search_in_all_files_content", "get_file_content", "get_file_content"]
+   next_tool_args: [
+     {"search_term": "def buggy_function"},
+     {"file_path": "utils.py"},
+     {"file_path": "helpers.py"}
+   ]
+
+6. **Invalid Format Examples** (Avoid These):
    - Missing any of the three required fields
    - JSON syntax errors in next_tool_args
    - Extra text outside the triplet format
    - Using incorrect tool names
    - Not quoting special characters properly
+   - Mismatch between number of tool names and argument objects in parallel calls
 """)
 
 FIX_TASK_SYSTEM_PROMPT = textwrap.dedent("""
@@ -153,25 +182,27 @@ class EnhancedCOT:
         def __init__(
             self,
             next_thought: str,
-            next_tool_name: str,
-            next_tool_args: dict,
-            observation: list | tuple | str,
+            next_tool_name: list[str],
+            next_tool_args: list[dict],
+            observation: list[tuple[int, str]],
             is_error: bool = False,
             raw_response: str = None,
             total_attempts: int = 0,
             inference_error_counter: dict = None,
             request_data: list = None,
+            is_parallel: bool = False,
         ):
             self.next_thought = next_thought
             self.next_tool_name = next_tool_name
             self.next_tool_args = next_tool_args
-            self.observation = ";".join(observation) if isinstance(observation, list) else observation
+            self.observation = observation
             self.is_error = is_error
             self.raw_response = raw_response
             self.total_attempts = total_attempts
             self.inference_error_counter = inference_error_counter
             self.request_data = request_data
             self.is_deleted = False
+            self.is_parallel = is_parallel
 
     def __init__(self, latest_observations_to_keep=5):
         self.thoughts: list[EnhancedCOT.Action] = []
@@ -199,56 +230,72 @@ class EnhancedCOT:
         for i, thought in enumerate(self.thoughts):
             if thought.is_deleted:
                 continue
-            if i < len(self.thoughts) - self.latest_observations_to_keep:
-                assistant_str = (
-                    f"next_thought:{thought.next_thought}\n"
-                    f"next_tool_name:{thought.next_tool_name}\n"
-                    f"next_tool_args:{thought.next_tool_args}\n"
-                )
-                if thought.observation is None:
-                    _obs_len = 0
-                elif isinstance(thought.observation, (list, tuple)):
-                    _obs_len = len(thought.observation)
-                else:
-                    _obs_len = len(str(thought.observation).splitlines())
-                user_str = (
-                    f"observation: {'error ocurred.' if thought.is_error else ''} output omitted ({_obs_len}) lines\n"
-                )
+
+            # 标准化工具列表（向后兼容：处理旧的字符串格式）
+            tool_names = (
+                thought.next_tool_name if isinstance(thought.next_tool_name, list) else [thought.next_tool_name]
+            )
+            tool_args_list = (
+                thought.next_tool_args if isinstance(thought.next_tool_args, list) else [thought.next_tool_args]
+            )
+            observations = thought.observation
+
+            # 确保长度一致
+            num_tools = max(len(tool_names), len(tool_args_list), len(observations) if observations else 0)
+            if len(tool_args_list) < num_tools:
+                tool_args_list = tool_args_list + [{}] * (num_tools - len(tool_args_list))
+                logger.info(f"tool_args_list is too short {len(tool_args_list)}<{num_tools}, padding with empty dict.")
+            if len(observations) < num_tools:
+                observations = observations + [("", "")] * (num_tools - len(observations))
+                logger.info(f"observations is too short {len(observations)}<{num_tools}, padding with empty string.")
+            # 判断是否需要省略详细信息
+            is_omitted = i < len(self.thoughts) - self.latest_observations_to_keep
+
+            # 构建assistant消息：包含thought和所有工具调用
+            assistant_parts = [f"next_thought:{thought.next_thought}"]
+
+            # 为每个工具构建章节
+            tool_sections = []
+            for tool_idx in range(num_tools):
+                tool_name = tool_names[tool_idx] if tool_idx < len(tool_names) else ""
+                tool_args = tool_args_list[tool_idx] if tool_idx < len(tool_args_list) else {}
+
+                # 格式化工具参数
+                try:
+                    args_str = json.dumps(tool_args, ensure_ascii=False) if tool_args else "{}"
+                except Exception:
+                    args_str = str(tool_args)
+
+                tool_section = f"tool_name: {tool_name}\ntool_args: {args_str}"
+                tool_sections.append(tool_section)
+
+            # 用分隔符连接所有工具章节
+            if tool_sections:
+                assistant_parts.append("\n\n---\n\n".join(tool_sections))
+
+            assistant_str = "\n".join(assistant_parts)
+
+            # 构建user消息：包含所有观察结果
+            if is_omitted:
+                # 省略详细信息
+                total_obs_lines = 0
+                for tool_idx, obs in observations:
+                    total_obs_lines += len(str(obs).splitlines())
+                user_str = f"observation: {'error ocurred. ' if thought.is_error else ''}output omitted ({total_obs_lines} lines)"
             else:
-                if thought.is_error is None or i == len(self.thoughts) - 1:
-                    assistant_str = f"next_thought:{thought.next_thought}\nnext_tool_name:{thought.next_tool_name}\nnext_tool_args:{thought.next_tool_args}"
-                    if isinstance(thought.observation, (list, tuple)):
-                        try:
-                            obs_render = json.dumps(list(thought.observation), ensure_ascii=False)
-                        except Exception:
-                            obs_render = str(thought.observation)
-                    else:
-                        obs_render = str(thought.observation)
-                    user_str = f"observation: {obs_render}"
+                # 显示详细信息
+                obs_sections = []
+                for tool_idx, obs in observations:
+                    obs_render = str(obs)
+
+                    tool_name = tool_names[tool_idx] if tool_idx < len(tool_names) else f"Tool {tool_idx + 1}"
+                    obs_sections.append(f"[{tool_name}]\n{obs_render}")
+
+                if obs_sections:
+                    user_str = "observation:\n\n" + "\n\n---\n\n".join(obs_sections)
                 else:
-                    if self.thoughts[-1].is_error == None and thought.is_error != None:
-                        assistant_str = (
-                            f"next_thought:{thought.next_thought}\n"
-                            f"next_tool_name:{thought.next_tool_name}\n"
-                            f"next_tool_args:{thought.next_tool_args}"
-                        )
-                        if thought.observation is None:
-                            _obs_len = 0
-                        elif isinstance(thought.observation, (list, tuple)):
-                            _obs_len = len(thought.observation)
-                        else:
-                            _obs_len = len(str(thought.observation).splitlines())
-                        user_str = f"observation: error ocurred. detailed output omitted ({_obs_len}) lines\n"
-                    else:
-                        assistant_str = f"next_thought:{thought.next_thought}\nnext_tool_name:{thought.next_tool_name}\nnext_tool_args:{thought.next_tool_args}"
-                        if isinstance(thought.observation, (list, tuple)):
-                            try:
-                                obs_render = json.dumps(list(thought.observation), ensure_ascii=False)
-                            except Exception:
-                                obs_render = str(thought.observation)
-                        else:
-                            obs_render = str(thought.observation)
-                        user_str = f"observation: {obs_render}"
+                    user_str = "observation: (no observations)"
+
             messages.append({"role": "assistant", "content": assistant_str})
             messages.append({"role": "user", "content": user_str})
         return messages
@@ -1762,6 +1809,39 @@ def get_test_runner_and_mode(repo_dir: str = "."):
     return "pytest", "FILE"
 
 
+INFINITE_LOOP_CHECK_PROMPT = textwrap.dedent(
+    """
+    You are an expert code reviewer specializing in infinite loop detection and prevention. Your task is to analyze the generated Python code for potential infinite loops and provide a corrected version if issues are found.
+
+    CRITICAL INFINITE LOOP DETECTION:
+    1. Check for while True: loops without guaranteed exit conditions
+    2. Verify all while loops have clear termination conditions
+    3. Ensure recursive functions have proper base cases
+    4. Look for loops that depend on external state that might never change
+    5. Check for patterns that could lead to infinite iteration
+
+    If you find potential infinite loops:
+    - Provide a corrected version of the code
+    - Ensure all loops have finite termination conditions
+    - Add reasonable iteration limits or timeout mechanisms where appropriate
+
+    If no infinite loops are detected:
+    - Return the original code unchanged
+
+    STRICT REQUIREMENT: Return the final Python code along with file names. Do not include any explanations, comments, or additional text.
+
+    example:
+    ```python
+    a.py
+    contents of a.py
+
+    b.py
+    contents of b.py
+    ```
+    """
+)
+
+
 def generate_initial_solution(problem_statement: str, code_skeleton: str, temperature: float = 0.7) -> str:
     GENERATE_SOLUTION_WITH_MULTI_STEP_REASONING_PROMPT = textwrap.dedent(
         """
@@ -1788,37 +1868,6 @@ def generate_initial_solution(problem_statement: str, code_skeleton: str, temper
         
         b.py
         {{content}}
-        ```
-        """
-    )
-    INFINITE_LOOP_CHECK_PROMPT = textwrap.dedent(
-        """
-        You are an expert code reviewer specializing in infinite loop detection and prevention. Your task is to analyze the generated Python code for potential infinite loops and provide a corrected version if issues are found.
-
-        CRITICAL INFINITE LOOP DETECTION:
-        1. Check for while True: loops without guaranteed exit conditions
-        2. Verify all while loops have clear termination conditions
-        3. Ensure recursive functions have proper base cases
-        4. Look for loops that depend on external state that might never change
-        5. Check for patterns that could lead to infinite iteration
-
-        If you find potential infinite loops:
-        - Provide a corrected version of the code
-        - Ensure all loops have finite termination conditions
-        - Add reasonable iteration limits or timeout mechanisms where appropriate
-
-        If no infinite loops are detected:
-        - Return the original code unchanged
-
-        STRICT REQUIREMENT: Return the final Python code along with file names. Do not include any explanations, comments, or additional text.
-
-        example:
-        ```python
-        a.py
-        contents of a.py
-
-        b.py
-        contents of b.py
         ```
         """
     )
@@ -2102,6 +2151,62 @@ def generate_initial_solution_with_patterns(
     return ""
 
 
+def execute_parallel_tools(tool_manager, tool_names: list, tool_args_list: list) -> list[tuple[int, str]]:
+    """
+    并行执行多个工具调用
+
+    Args:
+        tool_manager: 工具管理器实例
+        tool_names: 工具名称列表
+        tool_args_list: 工具参数列表，每个元素对应一个工具的参数
+
+    Returns:
+        工具执行结果列表，按输入顺序返回
+    """
+    if len(tool_names) != len(tool_args_list):
+        return [f"Error: Mismatch between tool names ({len(tool_names)}) and args ({len(tool_args_list)})"]
+
+    def execute_single_tool(tool_name: str, tool_args: dict) -> tuple[int, str]:
+        """执行单个工具并返回结果"""
+        try:
+            tool = tool_manager.get_tool(tool_name)
+            if isinstance(tool, str):  # Error message
+                return (tool_names.index(tool_name), tool)
+            if tool_args:
+                result = tool(**tool_args)
+            else:
+                result = tool()
+            return (tool_names.index(tool_name), result)
+        except EnhancedToolManager.Error as e:
+            return (tool_names.index(tool_name), f"observation: {e.message}")
+        except Exception as e:
+            import traceback
+
+            error_traceback = traceback.format_exc()
+            if isinstance(e, TypeError):
+                error_msg = f"observation: {str(e)}"
+            else:
+                error_msg = f"observation: {repr(e)} {error_traceback}"
+            return (tool_names.index(tool_name), error_msg)
+
+    # 使用线程池并行执行
+    results = [None] * len(tool_names)
+    with ThreadPoolExecutor(max_workers=min(len(tool_names), 10)) as executor:
+        futures = {
+            executor.submit(execute_single_tool, tool_name, tool_args): i
+            for i, (tool_name, tool_args) in enumerate(zip(tool_names, tool_args_list))
+        }
+        for future in as_completed(futures):
+            try:
+                idx, result = future.result()
+                results[idx] = result
+            except Exception as e:
+                idx = futures[future]
+                results[idx] = f"Error executing tool: {str(e)}"
+
+    return results
+
+
 def fix_task_solve_workflow(
     problem_statement: str,
     *,
@@ -2208,81 +2313,74 @@ def fix_task_solve_workflow(
                 request_data=messages,
             )
             break
-        logger.info(f"About to execute operation: {next_tool_name}")
-        try:
-            logger.info(
-                f"next_thought: {next_thought}\nnext_tool_name: {next_tool_name}\nnext_tool_args: {next_tool_args}\n"
-            )
+        # 统一处理：将单个工具调用转换为列表格式，统一使用并行执行逻辑
+        # 单个工具调用可以看作是并行调用的特例（只有一个工具）
+        is_parallel = isinstance(next_tool_name, list)
+
+        # 标准化为列表格式
+        if not is_parallel:
+            # 单个工具调用：转换为列表格式
             if '"' in next_tool_name or "'" in next_tool_name:
-                next_tool_name = next_tool_name.replace('"', "")
-                next_tool_name = next_tool_name.replace("'", "")
-            next_observation = (
-                tool_manager.get_tool(next_tool_name)(**next_tool_args)
-                if next_tool_args
-                else tool_manager.get_tool(next_tool_name)()
-            )
-            logger.info(f"next_observation: {next_observation}")
-            cot.add_action(
-                EnhancedCOT.Action(
-                    next_thought=next_thought,
-                    next_tool_name=next_tool_name,
-                    next_tool_args=next_tool_args,
-                    observation=next_observation,
-                    is_error=False,
-                    raw_response=raw_text,
-                    total_attempts=total_attempts,
-                    inference_error_counter=error_counter,
-                    request_data=messages,
-                )
-            )
-            if next_tool_name == "run_repo_tests":
-                if "failed" in str(next_observation).lower():
-                    last_test_result = "failed"
+                next_tool_name = next_tool_name.replace('"', "").replace("'", "")
+            tool_names = [next_tool_name]
+            tool_args_list = [next_tool_args] if next_tool_args else [{}]
+        else:
+            # 已经是并行调用：清理工具名称中的引号
+            tool_names = []
+            for tool_name in next_tool_name:
+                if isinstance(tool_name, str):
+                    cleaned_name = tool_name.replace('"', "").replace("'", "")
+                    tool_names.append(cleaned_name)
                 else:
-                    last_test_result = "success"
-        except EnhancedToolManager.Error as e:
-            import traceback  # Ensure traceback is accessible
+                    tool_names.append(tool_name)
 
-            error_msg = f"observation: {e.message}"
-            logger.error(f"Tool error: {error_msg}")
-            cot.add_action(
-                EnhancedCOT.Action(
-                    next_thought=next_thought,
-                    next_tool_name=next_tool_name,
-                    next_tool_args=next_tool_args,
-                    observation=error_msg,
-                    is_error=True,
-                    raw_response=raw_text,
-                    total_attempts=total_attempts,
-                    inference_error_counter=error_counter,
-                    request_data=messages,
-                )
-            )
-            continue
-        except Exception as e:
-            import traceback  # Ensure traceback is accessible
-
-            error_traceback = traceback.format_exc()
-            if isinstance(e, TypeError):
-                error_msg = f"observation: {str(e)}"
+            # 确保参数是列表格式
+            if not isinstance(next_tool_args, list):
+                tool_args_list = [next_tool_args] * len(tool_names)
             else:
-                error_msg = f"observation: {repr(e)} {error_traceback}"
-            logger.error(f"Tool error: {error_msg}")
-            cot.add_action(
-                EnhancedCOT.Action(
-                    next_thought=next_thought,
-                    next_tool_name=next_tool_name,
-                    next_tool_args=next_tool_args,
-                    observation=error_msg,
-                    is_error=True,
-                    raw_response=raw_text,
-                    total_attempts=total_attempts,
-                    inference_error_counter=error_counter,
-                    request_data=messages,
-                )
+                tool_args_list = next_tool_args
+
+        # 统一执行（单个或并行都使用相同的执行逻辑）
+        num_tools = len(tool_names)
+        execution_type = "parallel" if num_tools > 1 else "single"
+        logger.info(f"About to execute {num_tools} tool(s) ({execution_type}): {tool_names}")
+
+        logger.info(f"next_thought: {next_thought}\nnext_tool_name: {tool_names}\nnext_tool_args: {tool_args_list}\n")
+
+        # 执行工具（单个工具也会通过并行执行函数处理，但只有一个线程）
+        execution_results = execute_parallel_tools(tool_manager, tool_names, tool_args_list)
+
+        # 统一使用列表格式（单个和并行都使用列表，简化逻辑）
+        logger.info(f"{'Single' if num_tools == 1 else 'Parallel'} execution completed. {num_tools} tool(s) executed")
+
+        # 统一创建 Action（单个和并行使用相同的逻辑，都使用列表格式）
+        cot.add_action(
+            EnhancedCOT.Action(
+                next_thought=next_thought,
+                next_tool_name=tool_names,  # 统一使用列表格式
+                next_tool_args=tool_args_list,  # 统一使用列表格式
+                observation=execution_results,  # 统一使用列表格式
+                is_error=False,
+                raw_response=raw_text,
+                total_attempts=total_attempts,
+                inference_error_counter=error_counter,
+                request_data=messages,
+                is_parallel=(num_tools > 1),  # 仅用于标识语义，不影响格式
             )
-            continue
-        if next_tool_name == "finish":
+        )
+
+        # 统一检查测试结果（单个和并行都支持）
+        if "run_repo_tests" in tool_names:
+            test_idx = tool_names.index("run_repo_tests")
+            test_result = execution_results[test_idx]
+            if "failed" in str(test_result).lower():
+                last_test_result = "failed"
+            else:
+                last_test_result = "success"
+
+        # 检查finish工具（统一处理单个和并行调用）
+        if "finish" in tool_names:
+            # 如果包含finish，需要检查测试结果
             if last_test_result == "failed":
                 messages.append({"role": "user", "content": "The tests failed. Please fix the code and try again."})
                 continue
