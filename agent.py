@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 import requests
+from langfuse import observe
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -510,6 +511,7 @@ class EnhancedNetwork:
             return None
 
     @classmethod
+    @observe(name="llm-call", as_type="generation")
     def make_request(cls, messages: list, model: str, attempt: int = 0, temperature: float = 0.0) -> str:
         global run_id
         url = f"{DEFAULT_PROXY_URL.rstrip('/')}/api/inference"
@@ -2560,6 +2562,7 @@ def process_fix_task(input_dict: Dict[str, Any]):
     return patch_text
 
 
+@observe()
 def agent_main(input_dict: Dict[str, Any], repo_dir: str = "repo"):
     global DEFAULT_PROXY_URL, DEFAULT_TIMEOUT, run_id
     run_id = os.getenv("RUN_ID", "")

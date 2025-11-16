@@ -1,17 +1,22 @@
 """SandboxManager class for creating and managing Docker sandboxes."""
 
-import os
 import json
-import httpx
+import os
 import shutil
+from typing import Any, Callable, Dict, Optional
+
+import httpx
+
 import utils.logger as logger
-
-from typing import Any, Dict, Optional, Callable
-from utils.temp import create_temp_dir, delete_temp_dir
 from evaluator.models import Sandbox, SandboxResultWithLogs
-from utils.docker import get_docker_client, build_docker_image, create_internal_docker_network, connect_docker_container_to_internet, stop_and_delete_all_docker_containers
-
-
+from utils.docker import (
+    build_docker_image,
+    connect_docker_container_to_internet,
+    create_internal_docker_network,
+    get_docker_client,
+    stop_and_delete_all_docker_containers,
+)
+from utils.temp import create_temp_dir, delete_temp_dir
 
 SANDBOX_NETWORK_NAME = "sandbox-network"
 
@@ -19,11 +24,8 @@ SANDBOX_PROXY_HOST = "sandbox_proxy"
 SANDBOX_PROXY_PORT = 80
 
 
-
 class SandboxManager:
     """Manages Docker sandbox creation and execution."""
-
-
 
     def __init__(self, inference_gateway_url: str):
         # Setup inference gateway
@@ -46,8 +48,6 @@ class SandboxManager:
         build_docker_image(os.path.dirname(__file__) + "/proxy", "sandbox-proxy-image")
         self._create_sandbox_proxy(inference_gateway_url)
 
-
-
     def _check_inference_gateway(self, inference_gateway_url):
         logger.info(f"Checking inference gateway URL: {inference_gateway_url}")
 
@@ -58,43 +58,36 @@ class SandboxManager:
             # TODO ADAM: Send inference & embedding requests
 
             valid = True
-        except Exception as e:
+        except Exception:
             pass
 
         if not valid:
             logger.fatal(f"Inference gateway URL {inference_gateway_url} is invalid")
-        
+
         logger.info(f"Inference gateway URL {inference_gateway_url} is valid")
-
-
 
     def _create_sandbox_proxy(self, gateway_url):
         """
         Create the sandbox proxy server.
-        
+
         This is a special sandbox that runs a proxy server (nginx).
         This is the only sandbox that can access the internet.
-        
+
         The other sandboxes cannot directly access the internet.
         So to do inference, they send requests to this proxy server, which forwards appropriate requests to the inferencegateway.
         """
-  
+
         logger.info("Running sandbox proxy")
 
         self.proxy_container = get_docker_client().containers.run(
             name=SANDBOX_PROXY_HOST,
             image="sandbox-proxy-image",
             network=SANDBOX_NETWORK_NAME,
-            environment={
-                "GATEWAY_URL": gateway_url,
-                "GATEWAY_HOST": gateway_url.split("://")[1].split(":")[0]
-            },
-            detach=True
+            environment={"GATEWAY_URL": gateway_url, "GATEWAY_HOST": gateway_url.split("://")[1].split(":")[0]},
+            detach=True,
         )
 
         connect_docker_container_to_internet(self.proxy_container)
-
-
 
     def initialize_sandbox(
         self,
@@ -103,12 +96,13 @@ class SandboxManager:
         python_script_path: str,
         input_data: Any,
         env_vars: Dict[str, str] = {},
-        on_mount: Callable[[str], None] = None
+        on_mount: Callable[[str], None] = None,
+        allow_internet_access: bool = False,
     ) -> Sandbox:
         # Create temporary directory
         temp_dir = create_temp_dir()
         logger.debug(f"Created temporary directory for sandbox <{name}>: {temp_dir}")
-        
+
         if on_mount is not None:
             # Call on_mount
             logger.debug(f"Calling on_mount() for sandbox <{name}>...")
@@ -120,7 +114,7 @@ class SandboxManager:
         temp_python_script_path = os.path.join(temp_dir, python_script_name)
         shutil.copy2(python_script_path, temp_python_script_path)
         logger.debug(f"Copied Python script for sandbox <{name}>: {python_script_path} --> {temp_python_script_path}")
-        
+
         # Create input.json
         temp_input_json_path = os.path.join(temp_dir, "input.json")
         with open(temp_input_json_path, "w") as f:
@@ -136,29 +130,23 @@ class SandboxManager:
             user=f"{os.getuid()}:{os.getgid()}",
             environment={
                 "PYTHONUNBUFFERED": "1",
-                "PYTHONDONTWRITEBYTECODE": "1", # No __pycache__
+                "PYTHONDONTWRITEBYTECODE": "1",  # No __pycache__
                 "SANDBOX_PROXY_URL": f"http://{SANDBOX_PROXY_HOST}:{SANDBOX_PROXY_PORT}",
-                **env_vars
+                **env_vars,
             },
             command=f"python /sandbox/{python_script_name} 2>&1",
-            detach=True
+            detach=True,
         )
 
-        return Sandbox(
-            name=name,
-            temp_dir=temp_dir,
-            container=container
-        )
+        # Connect to internet if allowed
+        if allow_internet_access:
+            logger.debug(f"Connecting sandbox <{name}> to internet...")
+            connect_docker_container_to_internet(container)
+            logger.debug(f"Connected sandbox <{name}> to internet")
 
+        return Sandbox(name=name, temp_dir=temp_dir, container=container)
 
-
-    def run_sandbox(
-        self,
-        sandbox: Sandbox,
-        *,
-        timeout_seconds: Optional[int] = None
-    ) -> SandboxResultWithLogs:
-        
+    def run_sandbox(self, sandbox: Sandbox, *, timeout_seconds: Optional[int] = None) -> SandboxResultWithLogs:
         try:
             sandbox.container.wait(timeout=timeout_seconds)
 
