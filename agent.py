@@ -65,7 +65,7 @@ Try to use something different!
 FORMAT_PROMPT_V0 = textwrap.dedent("""
 **📝 Response Format Requirements**
 
-1. **Strict Triplet Format**:
+1. **Strict Triplet Format for Parallel Tool Calls to speed up exploration**:
    - `next_thought`: Detailed reasoning (include:
      - Problem understanding
      - Code analysis
@@ -78,30 +78,13 @@ FORMAT_PROMPT_V0 = textwrap.dedent("""
      - Tool-specific parameters
      - OR a JSON array of argument objects when using parallel tool calls
 
-2. **Parallel Tool Calls (Recommended for Exploration)**:
-   - You can call multiple tools in parallel to speed up exploration
-   - Format for parallel calls:
-     next_thought: "I'll search for multiple patterns in parallel to understand the codebase"
-     next_tool_name: ["search_in_all_files_content", "search_in_all_files_content", "get_file_content"]
-     next_tool_args: [
-       {"search_term": "def process_data", "case_sensitive": false},
-       {"search_term": "class DataProcessor", "case_sensitive": false},
-       {"file_path": "main.py"}
-     ]
-   - All parallel tool calls will execute simultaneously
-   - Results will be combined and returned together
-   - Use parallel calls when:
-     * Searching for multiple related patterns
-     * Reading multiple files simultaneously
-     * Exploring different aspects of the codebase
-
-3. **Error Handling Format**:
+2. **Error Handling Format**:
    - For errors: 
      next_thought: "Error: [detailed explanation]"
      next_tool_name: ""
      next_tool_args: {}
 
-4. **Example Valid Format (Single Tool)**:
+3. **Example Valid Format (Single Tool)**:
    next_thought: "I'll fix the JSON parsing issue by adding proper error handling and validation"
    next_tool_name: "apply_code_edit"
    next_tool_args: {
@@ -110,7 +93,7 @@ FORMAT_PROMPT_V0 = textwrap.dedent("""
      "replace": "try:\n    return json.loads(response)\nexcept JSONDecodeError:\n    logger.error(f'Invalid JSON: {{response}}')\n    raise"
    }
 
-5. **Example Valid Format (Parallel Tools)**:
+4. **Example Valid Format (Parallel Tools)**:
    next_thought: "I'll search for all occurrences of the bug pattern and read related files in parallel"
    next_tool_name: ["search_in_all_files_content", "get_file_content", "get_file_content"]
    next_tool_args: [
@@ -119,7 +102,7 @@ FORMAT_PROMPT_V0 = textwrap.dedent("""
      {"file_path": "helpers.py"}
    ]
 
-6. **Invalid Format Examples** (Avoid These):
+5. **Invalid Format Examples** (Avoid These):
    - Missing any of the three required fields
    - JSON syntax errors in next_tool_args
    - Extra text outside the triplet format
@@ -152,6 +135,15 @@ FIX_TASK_SYSTEM_PROMPT = textwrap.dedent("""
 - Keep searching the repository after each match and apply consistent changes to every relevant file before finishing.
 - Prefer using `search_in_all_files_content` to enumerate matches across the codebase and `search_in_specified_file_v2` to drill into each file; iterate until no applicable occurrences remain.
 - Re-run tests only after covering all discovered occurrences to avoid partial fixes.
+
+## Parallel Tool Calls:
+- You can call multiple tools in parallel to speed up exploration.
+- Usecases: 
+  - Searching for multiple related patterns
+  - Reading multiple files simultaneously
+  - Exploring different aspects of the codebase
+- All parallel tool calls will execute simultaneously
+- Results will be combined and returned together
 
 You have access to the following tools:-
 {tools_docs}
@@ -479,8 +471,8 @@ class EnhancedNetwork:
     def is_valid_response(cls, raw_text: str) -> bool:
         if type(raw_text) is dict and raw_text.get("error", None) is not None and raw_text.get("error") != "":
             return False, cls.ErrorType.EMPTY_RESPONSE.name
-        if not raw_text.strip().endswith("}") and not raw_text.strip().endswith("}]"):
-            return False, "Incomplete response, your response must be shorter to fit within context limit"
+        # if not raw_text.strip().endswith("}") and not raw_text.strip().endswith("}]"):
+        #     return False, "Incomplete response, your response must be shorter to fit within context limit"
         if len(raw_text) == 0:
             return False, cls.ErrorType.EMPTY_RESPONSE.name
         if "<|reserved_token_" in raw_text:
@@ -718,53 +710,107 @@ class EnhancedNetwork:
         return text_resp
 
     @classmethod
+    def _find_field_position(cls, text_resp: str, field_variants: list[str]) -> Optional[tuple[int, str]]:
+        """
+        查找字段在文本中的位置，支持多种变体
+
+        Args:
+            text_resp: 响应文本
+            field_variants: 字段名称的变体列表，例如 ["next_thought:", "thought:"]
+
+        Returns:
+            (position, matched_variant) 或 None
+        """
+        for variant in field_variants:
+            pos = text_resp.find(variant)
+            if pos != -1:
+                return (pos, variant)
+        return None
+
+    @classmethod
     def parse_response(cls, text_resp: str) -> tuple[str, Any, Any]:
         error_msg = None
         text_resp = text_resp.strip()
         text_resp = text_resp.split("observation:")[0]
         text_resp = text_resp.strip().strip("\n")
         text_resp = cls.sanitise_text_resp(text_resp)
-        if (
-            "next_thought:" in text_resp
-            and "next_tool_name:" in text_resp
-            and "next_tool_args:" in text_resp
-            and text_resp.find("next_thought:") < text_resp.find("next_tool_name:")
-            and text_resp.find("next_tool_name:") < text_resp.find("next_tool_args:")
-        ):
-            next_thought = text_resp.split("next_thought:")[1].split("next_tool_name:")[0].strip().strip("\n")
-            next_tool_name_raw = text_resp.split("next_tool_name:")[1].split("next_tool_args:")[0].strip().strip("\n")
-            next_tool_args_raw = (
-                text_resp.split("next_tool_args:")[1].strip().split("next_thought:")[0].strip().strip("\n")
-            )
-            try:
-                if next_tool_name_raw.startswith("["):
-                    next_tool_name = Utils.load_json(next_tool_name_raw)
+
+        # 定义字段名称的变体（按优先级排序）
+        thought_variants = ["next_thought:", "thought:"]
+        tool_name_variants = ["next_tool_name:", "tool_name:"]
+        tool_args_variants = ["next_tool_args:", "tool_args:"]
+
+        # 查找所有字段的位置
+        thought_pos = cls._find_field_position(text_resp, thought_variants)
+        tool_name_pos = cls._find_field_position(text_resp, tool_name_variants)
+        tool_args_pos = cls._find_field_position(text_resp, tool_args_variants)
+
+        # 检查是否所有必需字段都存在，并且顺序正确
+        if thought_pos and tool_name_pos and tool_args_pos:
+            thought_idx, thought_field = thought_pos
+            tool_name_idx, tool_name_field = tool_name_pos
+            tool_args_idx, tool_args_field = tool_args_pos
+
+            if thought_idx < tool_name_idx < tool_args_idx:
+                # 提取字段值
+                # 找到下一个字段的位置作为结束位置
+                next_field_after_thought = min(idx for idx, _ in [tool_name_pos, tool_args_pos] if idx > thought_idx)
+                next_thought = (
+                    text_resp[thought_idx + len(thought_field) : next_field_after_thought].strip().strip("\n")
+                )
+
+                # 提取 tool_name，结束位置是 tool_args 的开始位置
+                next_tool_name_raw = text_resp[tool_name_idx + len(tool_name_field) : tool_args_idx].strip().strip("\n")
+
+                # tool_args 是最后一个字段，找到文本结束或下一个可能的字段
+                remaining_text = text_resp[tool_args_idx + len(tool_args_field) :].strip()
+                # 尝试找到下一个可能的字段开始位置（如果有重复的字段）
+                next_thought_pos_after = remaining_text.find("next_thought:")
+                if next_thought_pos_after == -1:
+                    next_thought_pos_after = remaining_text.find("thought:")
+                if next_thought_pos_after != -1:
+                    next_tool_args_raw = remaining_text[:next_thought_pos_after].strip().strip("\n")
                 else:
-                    next_tool_name = [next_tool_name_raw]
-                parsed_args = cls.parse_next_tool_args(next_tool_name, next_tool_args_raw)
-                if isinstance(parsed_args, list):
-                    next_tool_args = parsed_args
+                    next_tool_args_raw = remaining_text.strip().strip("\n")
+
+                try:
+                    if next_tool_name_raw.startswith("["):
+                        next_tool_name = Utils.load_json(next_tool_name_raw)
+                    else:
+                        next_tool_name = [next_tool_name_raw]
+                    parsed_args = cls.parse_next_tool_args(next_tool_name, next_tool_args_raw)
+                    if isinstance(parsed_args, list):
+                        next_tool_args = parsed_args
+                    else:
+                        next_tool_args = [parsed_args for _ in next_tool_name]
+                except JSONDecodeError as e:
+                    error_msg = f"Invalid JSON: {str(e)}"
+                    return None, None, None, error_msg
+
+                if len(next_tool_name) == 1:
+                    return next_thought, next_tool_name[0], next_tool_args[0], error_msg
+                return next_thought, next_tool_name, next_tool_args, error_msg
+            else:
+                # 顺序错误
+                if thought_idx > tool_name_idx:
+                    error_msg = "Invalid response. thought field is after tool_name field"
+                elif tool_name_idx > tool_args_idx:
+                    error_msg = "Invalid response. tool_name field is after tool_args field"
                 else:
-                    next_tool_args = [parsed_args for _ in next_tool_name]
-            except JSONDecodeError as e:
-                error_msg = f"Invalid JSON: {str(e)}"
+                    error_msg = "Invalid response. Field order is incorrect"
+                return None, None, None, error_msg
         else:
-            if "next_thought:" not in text_resp:
-                error_msg = "Invalid response. next_thought not found"
-            elif "next_tool_name:" not in text_resp:
-                error_msg = "Invalid response. next_tool_name not found"
-            elif "next_tool_args:" not in text_resp:
-                error_msg = "Invalid response. next_tool_args not found"
-            elif text_resp.find("next_thought:") > text_resp.find("next_tool_name:"):
-                error_msg = "Invalid response. next_thought is after next_tool_name"
-            elif text_resp.find("next_tool_name:") > text_resp.find("next_tool_args:"):
-                error_msg = "Invalid response. next_tool_name is after next_tool_args"
+            # 缺少必需字段
+            if not thought_pos:
+                error_msg = "Invalid response. thought/next_thought field not found"
+            elif not tool_name_pos:
+                error_msg = "Invalid response. tool_name/next_tool_name field not found"
+            elif not tool_args_pos:
+                error_msg = "Invalid response. tool_args/next_tool_args field not found"
             else:
                 logger.error(f"We have no clue why parsing failed. Please check this \n{text_resp}\n")
+                error_msg = "Unknown parsing error"
             return None, None, None, error_msg
-        if len(next_tool_name) == 1:
-            return next_thought, next_tool_name[0], next_tool_args[0], error_msg
-        return next_thought, next_tool_name, next_tool_args, error_msg
 
 
 class FunctionVisitor(ast.NodeVisitor):
@@ -2197,12 +2243,19 @@ def execute_parallel_tools(tool_manager, tool_names: list, tool_args_list: list)
             for i, (tool_name, tool_args) in enumerate(zip(tool_names, tool_args_list))
         }
         for future in as_completed(futures):
+            original_idx = futures[future]  # 保存原始索引，用于错误处理
             try:
-                idx, result = future.result()
-                results[idx] = result
+                result = future.result()
+                idx, tool_result = result
+                results[original_idx] = (idx, tool_result)
             except Exception as e:
-                idx = futures[future]
-                results[idx] = f"Error executing tool: {str(e)}"
+                results[original_idx] = (idx, f"Error executing tool: {str(e)}")
+
+    # 确保所有结果都是元组格式（处理可能的 None 值）
+    for i in range(len(results)):
+        if results[i] is None:
+            logger.warning(f"Tool {tool_names[i]} at index {i} did not complete - no result was stored")
+            results[i] = (i, "Error: Tool execution did not complete")
 
     return results
 
@@ -2260,15 +2313,20 @@ def fix_task_solve_workflow(
                     request_data=[],
                 )
             )
+            logger.info("global timeout reached, breaking out of the loop")
             break
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": instance_prompt},
         ]
-        messages.extend(cot.to_str())
+        try:
+            messages.extend(cot.to_str())
+        except Exception as e:
+            logger.error(f"Error extending cot to str: {e}", exc_info=True, stack_info=True)
+            break
         messages.append({"role": "system", "content": STOP_INSTRUCTION})
         temperature = 0
-        selected_model = GLM_MODEL_NAME
+        selected_model = KIMI_MODEL_NAME
         if cot.is_thought_repeated():
             logger.info("[TEST_PATCH_FIND] Thought repeated, adding DO NOT REPEAT TOOL CALLS instruction")
             last_thought = cot.thoughts[-1]
@@ -2372,11 +2430,13 @@ def fix_task_solve_workflow(
         # 统一检查测试结果（单个和并行都支持）
         if "run_repo_tests" in tool_names:
             test_idx = tool_names.index("run_repo_tests")
-            test_result = execution_results[test_idx]
-            if "failed" in str(test_result).lower():
+            test_result = execution_results[test_idx][1] if execution_results[test_idx] else None
+            if test_result and "failed" in str(test_result).lower():
                 last_test_result = "failed"
             else:
                 last_test_result = "success"
+
+        logger.info(f"last_test_result: {last_test_result}")
 
         # 检查finish工具（统一处理单个和并行调用）
         if "finish" in tool_names:
