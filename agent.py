@@ -730,6 +730,59 @@ class EnhancedNetwork:
         return None
 
     @classmethod
+    def _find_json_end(cls, text: str) -> int:
+        """
+        在文本开头查找一个完整 JSON 对象或数组的结束位置
+        基于括号匹配：{ } 或 [ ]
+
+        Args:
+            text: 以 JSON 开头的文本（可能后面跟着其他内容）
+
+        Returns:
+            JSON 结束位置的索引（不包含），如果找不到完整 JSON 则返回 -1
+        """
+        text = text.strip()
+        if not text:
+            return -1
+
+        # 判断是对象还是数组
+        if text[0] == "{":
+            open_char, close_char = "{", "}"
+        elif text[0] == "[":
+            open_char, close_char = "[", "]"
+        else:
+            return -1
+
+        depth = 0
+        in_string = False
+        escape_next = False
+
+        for i, char in enumerate(text):
+            if escape_next:
+                escape_next = False
+                continue
+
+            if char == "\\":
+                escape_next = True
+                continue
+
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+
+            if in_string:
+                continue
+
+            if char == open_char:
+                depth += 1
+            elif char == close_char:
+                depth -= 1
+                if depth == 0:
+                    return i + 1  # 返回结束位置（包含结束字符）
+
+        return -1  # 没有找到匹配的结束括号
+
+    @classmethod
     def parse_response(cls, text_resp: str) -> tuple[str, Any, Any]:
         error_msg = None
         text_resp = text_resp.strip()
@@ -742,67 +795,13 @@ class EnhancedNetwork:
         tool_name_variants = ["next_tool_name:", "tool_name:"]
         tool_args_variants = ["next_tool_args:", "tool_args:"]
 
-        # 查找所有字段的位置
+        # 查找三个关键字段的首次出现位置
         thought_pos = cls._find_field_position(text_resp, thought_variants)
         tool_name_pos = cls._find_field_position(text_resp, tool_name_variants)
         tool_args_pos = cls._find_field_position(text_resp, tool_args_variants)
 
-        # 检查是否所有必需字段都存在，并且顺序正确
-        if thought_pos and tool_name_pos and tool_args_pos:
-            thought_idx, thought_field = thought_pos
-            tool_name_idx, tool_name_field = tool_name_pos
-            tool_args_idx, tool_args_field = tool_args_pos
-
-            if thought_idx < tool_name_idx < tool_args_idx:
-                # 提取字段值
-                # 找到下一个字段的位置作为结束位置
-                next_field_after_thought = min(idx for idx, _ in [tool_name_pos, tool_args_pos] if idx > thought_idx)
-                next_thought = (
-                    text_resp[thought_idx + len(thought_field) : next_field_after_thought].strip().strip("\n")
-                )
-
-                # 提取 tool_name，结束位置是 tool_args 的开始位置
-                next_tool_name_raw = text_resp[tool_name_idx + len(tool_name_field) : tool_args_idx].strip().strip("\n")
-
-                # tool_args 是最后一个字段，找到文本结束或下一个可能的字段
-                remaining_text = text_resp[tool_args_idx + len(tool_args_field) :].strip()
-                # 尝试找到下一个可能的字段开始位置（如果有重复的字段）
-                next_thought_pos_after = remaining_text.find("next_thought:")
-                if next_thought_pos_after == -1:
-                    next_thought_pos_after = remaining_text.find("thought:")
-                if next_thought_pos_after != -1:
-                    next_tool_args_raw = remaining_text[:next_thought_pos_after].strip().strip("\n")
-                else:
-                    next_tool_args_raw = remaining_text.strip().strip("\n")
-
-                try:
-                    if next_tool_name_raw.startswith("["):
-                        next_tool_name = Utils.load_json(next_tool_name_raw)
-                    else:
-                        next_tool_name = [next_tool_name_raw]
-                    parsed_args = cls.parse_next_tool_args(next_tool_name, next_tool_args_raw)
-                    if isinstance(parsed_args, list):
-                        next_tool_args = parsed_args
-                    else:
-                        next_tool_args = [parsed_args for _ in next_tool_name]
-                except JSONDecodeError as e:
-                    error_msg = f"Invalid JSON: {str(e)}"
-                    return None, None, None, error_msg
-
-                if len(next_tool_name) == 1:
-                    return next_thought, next_tool_name[0], next_tool_args[0], error_msg
-                return next_thought, next_tool_name, next_tool_args, error_msg
-            else:
-                # 顺序错误
-                if thought_idx > tool_name_idx:
-                    error_msg = "Invalid response. thought field is after tool_name field"
-                elif tool_name_idx > tool_args_idx:
-                    error_msg = "Invalid response. tool_name field is after tool_args field"
-                else:
-                    error_msg = "Invalid response. Field order is incorrect"
-                return None, None, None, error_msg
-        else:
-            # 缺少必需字段
+        # 基本字段校验
+        if not (thought_pos and tool_name_pos and tool_args_pos):
             if not thought_pos:
                 error_msg = "Invalid response. thought/next_thought field not found"
             elif not tool_name_pos:
@@ -813,6 +812,161 @@ class EnhancedNetwork:
                 logger.error(f"We have no clue why parsing failed. Please check this \n{text_resp}\n")
                 error_msg = "Unknown parsing error"
             return None, None, None, error_msg
+
+        thought_idx, thought_field = thought_pos
+        tool_name_idx, tool_name_field = tool_name_pos
+        tool_args_idx, tool_args_field = tool_args_pos
+
+        # 顺序校验：必须是 thought -> tool_name -> tool_args
+        if not (thought_idx < tool_name_idx < tool_args_idx):
+            if thought_idx > tool_name_idx:
+                error_msg = "Invalid response. thought field is after tool_name field"
+            elif tool_name_idx > tool_args_idx:
+                error_msg = "Invalid response. tool_name field is after tool_args field"
+            else:
+                error_msg = "Invalid response. Field order is incorrect"
+            return None, None, None, error_msg
+
+        # 1. 解析 next_thought
+        next_field_after_thought = min(idx for idx, _ in [tool_name_pos, tool_args_pos] if idx > thought_idx)
+        next_thought = text_resp[thought_idx + len(thought_field) : next_field_after_thought].strip().strip("\n")
+
+        # 2. 检查是否为「规范的并行调用」（next_tool_name/next_tool_args 都是 JSON 列表）
+        first_tool_name_segment = text_resp[tool_name_idx + len(tool_name_field) : tool_args_idx].strip().strip("\n")
+        if first_tool_name_segment.startswith("["):
+            # 规范的列表格式，保持原有逻辑：一次性解析 name 列表 + args 列表
+            remaining_text = text_resp[tool_args_idx + len(tool_args_field) :].strip()
+            try:
+                next_tool_name = Utils.load_json(first_tool_name_segment)
+                parsed_args = cls.parse_next_tool_args(next_tool_name, remaining_text)
+                if isinstance(parsed_args, list):
+                    next_tool_args = parsed_args
+                else:
+                    next_tool_args = [parsed_args for _ in next_tool_name]
+            except JSONDecodeError as e:
+                error_msg = f"Invalid JSON: {str(e)}"
+                return None, None, None, error_msg
+            except Exception as e:
+                error_msg = str(e)
+                return None, None, None, error_msg
+
+            if len(next_tool_name) == 1:
+                return next_thought, next_tool_name[0], next_tool_args[0], error_msg
+            return next_thought, next_tool_name, next_tool_args, error_msg
+
+        # 3. 容错模式：循环扫描多个 tool_name/tool_args 对，兼容模型「幻觉」连续输出
+        tool_names: list[str] = []
+        tool_args_list: list[Any] = []
+
+        # 从第一个 tool_name 开始向后扫描
+        content = text_resp[tool_name_idx:]
+        cursor = 0
+        content_len = len(content)
+
+        while cursor < content_len:
+            # 3.1 查找下一个 tool_name 位置（支持多种变体）
+            next_name_pos = None
+            next_name_field = None
+            for variant in tool_name_variants:
+                idx = content.find(variant, cursor)
+                if idx != -1 and (next_name_pos is None or idx < next_name_pos):
+                    next_name_pos = idx
+                    next_name_field = variant
+
+            if next_name_pos is None:
+                break
+
+            # 3.2 在该 tool_name 之后查找最近的 tool_args
+            next_args_pos = None
+            next_args_field = None
+            search_start = next_name_pos + len(next_name_field)
+            for variant in tool_args_variants:
+                idx = content.find(variant, search_start)
+                if idx != -1 and (next_args_pos is None or idx < next_args_pos):
+                    next_args_pos = idx
+                    next_args_field = variant
+
+            if next_args_pos is None:
+                # 找不到匹配的 tool_args，则停止解析后续内容
+                break
+
+            # 3.3 提取单个 tool_name 值
+            name_value = (
+                content[next_name_pos + len(next_name_field) : next_args_pos]
+                .strip()
+                .strip("\n")
+                .strip("'")
+                .strip('"')
+                .strip()
+            )
+            if not name_value:
+                # 空的 tool_name，直接跳过本次，避免死循环
+                cursor = next_args_pos + len(next_args_field)
+                continue
+
+            # 3.4 提取对应的 tool_args 文本，优先基于 JSON 结构，其次基于字段边界
+            args_region = content[next_args_pos + len(next_args_field) :].strip()
+            if not args_region:
+                break
+
+            # 先尝试基于 JSON 结构找到完整的 JSON 结束位置
+            json_end = cls._find_json_end(args_region)
+
+            if json_end > 0:
+                # 找到了完整的 JSON，直接使用
+                next_tool_args_raw = args_region[:json_end].strip()
+            else:
+                # JSON 结构不完整或格式异常，回退到使用字段边界截断
+                end_idx = len(args_region)
+
+                # 检查所有可能的下一个字段
+                for variant_list in [thought_variants, tool_name_variants, tool_args_variants]:
+                    for variant in variant_list:
+                        d_idx = args_region.find("\n" + variant)
+                        if d_idx != -1 and d_idx < end_idx:
+                            end_idx = d_idx
+
+                # 同时检查 observation: 作为硬截断
+                obs_idx = args_region.find("\nobservation:")
+                if obs_idx != -1 and obs_idx < end_idx:
+                    end_idx = obs_idx
+
+                next_tool_args_raw = args_region[:end_idx].strip().strip("\n")
+
+            if not next_tool_args_raw:
+                # 没有有效的 args，跳到下一个位置继续尝试
+                cursor = next_args_pos + len(next_args_field)
+                continue
+
+            # 3.5 使用现有的 JSON 容错逻辑解析单个 tool_args
+            try:
+                parsed_args_single = cls.parse_next_tool_args(name_value, next_tool_args_raw)
+            except JSONDecodeError as e:
+                error_msg = f"Invalid JSON: {str(e)}"
+                return None, None, None, error_msg
+            except Exception as e:
+                # 如果某个调用解析失败，直接返回错误，避免继续在坏格式上解析
+                error_msg = str(e)
+                return None, None, None, error_msg
+
+            tool_names.append(name_value)
+            tool_args_list.append(parsed_args_single)
+
+            # 3.6 推进游标，继续查找下一组 tool_name/tool_args
+            # 根据是否使用了 JSON 结构截断，计算正确的推进位置
+            if json_end > 0:
+                cursor = next_args_pos + len(next_args_field) + json_end
+            else:
+                cursor = next_args_pos + len(next_args_field) + len(next_tool_args_raw)
+
+        if not tool_names:
+            error_msg = "Invalid response. tool_name/next_tool_name field not found"
+            return None, None, None, error_msg
+
+        # 根据数量返回：单个调用返回标量，多于一个返回列表（并行调用）
+        if len(tool_names) == 1:
+            return next_thought, tool_names[0], tool_args_list[0], error_msg
+        return next_thought, tool_names, tool_args_list, error_msg
 
 
 class FunctionVisitor(ast.NodeVisitor):
